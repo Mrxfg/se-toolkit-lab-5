@@ -9,7 +9,7 @@ from app.models.interaction import InteractionLog
 async def read_interactions(session: AsyncSession) -> list[InteractionLog]:
     """Read all interactions from the database."""
     result = await session.exec(select(InteractionLog))
-    return list(result.all())
+    return result.all()
 
 
 async def create_interaction(
