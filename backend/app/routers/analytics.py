@@ -1,142 +1,167 @@
-"""Router for analytics endpoints using `interacts` table, safe for all labs."""
-
-from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy import func, case
+from fastapi import APIRouter, Depends, Query
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel import select
+from sqlalchemy import func, case
 
 from app.database import get_session
+from app.models.item import ItemRecord
 from app.models.interaction import InteractionLog
-from app.models.item import ItemRecord as Item
 from app.models.learner import Learner
 
-router = APIRouter(prefix="/analytics", tags=["analytics"])
+router = APIRouter()
 
 
-async def get_lab_item(lab: str, session: AsyncSession) -> Item | None:
-    """Find the lab item by case-insensitive match."""
-    result = await session.exec(
-        select(Item).where(Item.title.ilike(f"%{lab}%"))
-    )
-    return result.first()
-
-
-async def get_task_ids(lab_item: Item, session: AsyncSession) -> list[int]:
-    """Get IDs of tasks belonging to a lab."""
-    tasks = await session.exec(select(Item.id).where(Item.parent_id == lab_item.id))
-    return [t for t in tasks.all()]
+def _lab_title(lab: str) -> str:
+    return lab.replace("-", " ").title()
 
 
 @router.get("/scores")
-async def get_scores(lab: str = Query(...), session: AsyncSession = Depends(get_session)):
-    lab_item = await get_lab_item(lab, session)
-    if not lab_item:
-        return [{"bucket": b, "count": 0} for b in ["0-25", "26-50", "51-75", "76-100"]]
+async def get_scores(
+    lab: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+):
 
-    task_ids = await get_task_ids(lab_item, session)
-    if not task_ids:
-        return [{"bucket": b, "count": 0} for b in ["0-25", "26-50", "51-75", "76-100"]]
+    title = _lab_title(lab)
 
-    buckets = [("0-25", 0, 25), ("26-50", 26, 50), ("51-75", 51, 75), ("76-100", 76, 100)]
-    case_expr = [
-        func.count(case(((InteractionLog.score >= low) & (InteractionLog.score <= high), 1))).label(bucket)
-        for bucket, low, high in buckets
-    ]
-
-    result = await session.exec(
-        select(*case_expr).where(
-            InteractionLog.item_id.in_(task_ids),
-            InteractionLog.score != None
-        )
+    res = await session.exec(
+        select(ItemRecord).where(ItemRecord.title.contains(title))
     )
-    counts = result.one()
-    return [{"bucket": buckets[i][0], "count": counts[i]} for i in range(len(buckets))]
+    lab_item = res.first()
+
+    res = await session.exec(
+        select(ItemRecord.id).where(ItemRecord.parent_id == lab_item.id)
+    )
+    task_ids = res.all()
+
+    bucket_case = case(
+        (InteractionLog.score <= 25, "0-25"),
+        (InteractionLog.score <= 50, "26-50"),
+        (InteractionLog.score <= 75, "51-75"),
+        else_="76-100",
+    )
+
+    res = await session.exec(
+        select(bucket_case, func.count())
+        .where(InteractionLog.item_id.in_(task_ids))
+        .group_by(bucket_case)
+    )
+
+    counts = {b: c for b, c in res.all()}
+    buckets = ["0-25", "26-50", "51-75", "76-100"]
+
+    return [{"bucket": b, "count": counts.get(b, 0)} for b in buckets]
 
 
 @router.get("/pass-rates")
-async def get_pass_rates(lab: str = Query(...), session: AsyncSession = Depends(get_session)):
-    """Per-task pass rates (NULL-safe)."""
-    lab_item = await get_lab_item(lab, session)
-    if not lab_item:
-        return []
+async def get_pass_rates(
+    lab: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+):
 
-    tasks = await session.exec(select(Item).where(Item.parent_id == lab_item.id))
-    tasks = tasks.all()
+    title = _lab_title(lab)
+
+    res = await session.exec(
+        select(ItemRecord).where(ItemRecord.title.contains(title))
+    )
+    lab_item = res.first()
+
+    res = await session.exec(
+        select(ItemRecord).where(ItemRecord.parent_id == lab_item.id)
+    )
+    tasks = res.all()
+
     result = []
 
     for task in tasks:
-        agg = await session.exec(
+        stats = await session.exec(
             select(
-                func.round(func.avg(InteractionLog.score), 1),
-                func.count(InteractionLog.id)
+                func.avg(InteractionLog.score),
+                func.count(InteractionLog.id),
             ).where(InteractionLog.item_id == task.id)
         )
-        row = agg.first()
-        if row:
-            avg_score, attempts = row
-        else:
-            avg_score, attempts = 0.0, 0
 
-        result.append({
-            "task": task.title,
-            "avg_score": avg_score or 0.0,
-            "attempts": attempts
-        })
+        avg_score, attempts = stats.first()
+
+        result.append(
+            {
+                "task": task.title,
+                "avg_score": round(avg_score, 1) if avg_score else 0,
+                "attempts": attempts,
+            }
+        )
 
     return sorted(result, key=lambda x: x["task"])
 
 
 @router.get("/timeline")
-async def get_timeline(lab: str = Query(...), session: AsyncSession = Depends(get_session)):
-    """Submissions per day."""
-    lab_item = await get_lab_item(lab, session)
-    if not lab_item:
-        return []
+async def get_timeline(
+    lab: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+):
 
-    task_ids = await get_task_ids(lab_item, session)
-    if not task_ids:
-        return []
+    title = _lab_title(lab)
 
-    result = await session.exec(
-        select(
-            func.date(InteractionLog.created_at).label("date"),
-            func.count().label("submissions")
-        ).where(InteractionLog.item_id.in_(task_ids))
-         .group_by(func.date(InteractionLog.created_at))
-         .order_by(func.date(InteractionLog.created_at))
+    res = await session.exec(
+        select(ItemRecord).where(ItemRecord.title.contains(title))
     )
-    return [{"date": str(r.date), "submissions": r.submissions} for r in result.all()]
+    lab_item = res.first()
+
+    res = await session.exec(
+        select(ItemRecord.id).where(ItemRecord.parent_id == lab_item.id)
+    )
+    task_ids = res.all()
+
+    res = await session.exec(
+        select(
+            func.date(InteractionLog.created_at),
+            func.count()
+        )
+        .where(InteractionLog.item_id.in_(task_ids))
+        .group_by(func.date(InteractionLog.created_at))
+        .order_by(func.date(InteractionLog.created_at))
+    )
+
+    return [
+        {"date": str(d), "submissions": c}
+        for d, c in res.all()
+    ]
 
 
 @router.get("/groups")
-async def get_groups(lab: str = Query(...), session: AsyncSession = Depends(get_session)):
-    """Per-group performance (NULL-safe)."""
-    lab_item = await get_lab_item(lab, session)
-    if not lab_item:
-        return []
+async def get_groups(
+    lab: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+):
 
-    task_ids = await get_task_ids(lab_item, session)
-    if not task_ids:
-        return []
+    title = _lab_title(lab)
 
-    result = await session.exec(
+    res = await session.exec(
+        select(ItemRecord).where(ItemRecord.title.contains(title))
+    )
+    lab_item = res.first()
+
+    res = await session.exec(
+        select(ItemRecord.id).where(ItemRecord.parent_id == lab_item.id)
+    )
+    task_ids = res.all()
+
+    res = await session.exec(
         select(
             Learner.student_group,
-            func.round(func.avg(InteractionLog.score), 1).label("avg_score"),
-            func.count(func.distinct(InteractionLog.learner_id)).label("students")
-        ).join(Learner, Learner.id == InteractionLog.learner_id)
-        .where(
-            InteractionLog.item_id.in_(task_ids),
-            InteractionLog.score != None
+            func.avg(InteractionLog.score),
+            func.count(func.distinct(InteractionLog.learner_id)),
         )
+        .join(Learner, Learner.id == InteractionLog.learner_id)
+        .where(InteractionLog.item_id.in_(task_ids))
         .group_by(Learner.student_group)
         .order_by(Learner.student_group)
     )
+
     return [
         {
-            "group": r.student_group,
-            "avg_score": r.avg_score or 0.0,
-            "students": r.students
+            "group": g,
+            "avg_score": round(avg, 1),
+            "students": s,
         }
-        for r in result.all()
+        for g, avg, s in res.all()
     ]
